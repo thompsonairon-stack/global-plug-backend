@@ -1,0 +1,736 @@
+backend/package.json
+{
+  "name": "global-plug-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0"
+  }
+}
+
+
+
+backend/.env.example
+PORT=3000
+KRAKEN_API_KEY=
+KRAKEN_API_SECRET=
+
+
+
+backend/server.js
+const express = require("express");
+const cors = require("cors");
+const dotenv = require("dotenv");
+
+dotenv.config();
+
+const krakenRoute = require("./api/krakenRoute");
+const balanceRoute = require("./api/balanceRoute");
+const engineRoute = require("./api/engineRoute");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+console.log("=== Kraken ENV CHECK ===");
+console.log("has key:", !!process.env.KRAKEN_API_KEY);
+console.log("has secret:", !!process.env.KRAKEN_API_SECRET);
+console.log("========================");
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "global-plug-backend" });
+});
+
+app.use("/api/kraken", krakenRoute);
+app.use("/api/account", balanceRoute);
+app.use("/api/engine", engineRoute);
+
+const port = Number(process.env.PORT || 3000);
+
+app.listen(port, () => {
+  console.log(`Global Plug backend running on port ${port}`);
+});
+
+
+
+backend/config/krakenClient.js
+const crypto = require("crypto");
+const fetch = require("node-fetch");
+
+const API_BASE = "https://api.kraken.com";
+
+function getKrakenEnv() {
+  const apiKey = process.env.KRAKEN_API_KEY || "";
+  const apiSecret = process.env.KRAKEN_API_SECRET || "";
+
+  if (!apiKey || !apiSecret) {
+    throw new Error("Missing KRAKEN_API_KEY or KRAKEN_API_SECRET");
+  }
+
+  return { apiKey, apiSecret };
+}
+
+function buildKrakenSignature(path, body, apiSecret) {
+  const nonce = String(body.nonce);
+  const postData = new URLSearchParams(body).toString();
+
+  const sha256 = crypto
+    .createHash("sha256")
+    .update(Buffer.concat([Buffer.from(nonce), Buffer.from(postData)]))
+    .digest();
+
+  const hmac = crypto
+    .createHmac("sha512", Buffer.from(apiSecret, "base64"))
+    .update(Buffer.concat([Buffer.from(path), sha256]))
+    .digest("base64");
+
+  return hmac;
+}
+
+async function privateRequest(path, params = {}) {
+  const { apiKey, apiSecret } = getKrakenEnv();
+
+  const body = {
+    nonce: Date.now().toString(),
+    ...params
+  };
+
+  const postData = new URLSearchParams(body).toString();
+  const apiSign = buildKrakenSignature(path, body, apiSecret);
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "API-Key": apiKey,
+      "API-Sign": apiSign,
+      "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"
+    },
+    body: postData
+  });
+
+  const json = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`Kraken HTTP ${response.status}: ${JSON.stringify(json)}`);
+  }
+
+  if (json.error && json.error.length) {
+    throw new Error(`Kraken API error: ${json.error.join(", ")}`);
+  }
+
+  return json.result;
+}
+
+async function publicRequest(path, query = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+
+  for (const [key, value] of Object.entries(query)) {
+    url.searchParams.set(key, String(value));
+  }
+
+  const response = await fetch(url.toString(), { method: "GET" });
+  const json = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`Kraken HTTP ${response.status}: ${JSON.stringify(json)}`);
+  }
+
+  if (json.error && json.error.length) {
+    throw new Error(`Kraken API error: ${json.error.join(", ")}`);
+  }
+
+  return json.result;
+}
+
+async function getBalance() {
+  return privateRequest("/0/private/Balance");
+}
+
+async function getOpenOrders() {
+  return privateRequest("/0/private/OpenOrders");
+}
+
+async function addOrder({ pair, side, volume, ordertype = "market", price }) {
+  const params = {
+    pair,
+    type: side,
+    ordertype,
+    volume: String(volume)
+  };
+
+  if (price != null) {
+    params.price = String(price);
+  }
+
+  return privateRequest("/0/private/AddOrder", params);
+}
+
+async function cancelOrder(txid) {
+  return privateRequest("/0/private/CancelOrder", { txid });
+}
+
+async function getTicker(pair) {
+  const result = await publicRequest("/0/public/Ticker", { pair });
+  const key = Object.keys(result)[0];
+  const data = result[key];
+
+  return {
+    pair,
+    ask: Number(data.a?.[0] || 0),
+    bid: Number(data.b?.[0] || 0),
+    last: Number(data.c?.[0] || 0),
+    volume24h: Number(data.v?.[1] || 0)
+  };
+}
+
+async function getCandles(pair, interval = 60) {
+  const result = await publicRequest("/0/public/OHLC", { pair, interval });
+  const key = Object.keys(result).find((k) => k !== "last");
+  const rows = result[key] || [];
+
+  return rows.map((r) => ({
+    time: Number(r[0]),
+    open: Number(r[1]),
+    high: Number(r[2]),
+    low: Number(r[3]),
+    close: Number(r[4]),
+    vwap: Number(r[5]),
+    volume: Number(r[6]),
+    count: Number(r[7])
+  }));
+}
+
+module.exports = {
+  privateRequest,
+  publicRequest,
+  getBalance,
+  getOpenOrders,
+  addOrder,
+  cancelOrder,
+  getTicker,
+  getCandles
+};
+
+
+
+backend/api/krakenRoute.js
+const express = require("express");
+const {
+  getBalance,
+  getTicker,
+  getCandles,
+  cancelOrder
+} = require("../config/krakenClient");
+
+const router = express.Router();
+
+router.get("/test", async (_req, res) => {
+  try {
+    const balance = await getBalance();
+
+    res.json({
+      success: true,
+      message: "Kraken connection OK",
+      hasAssets: Object.keys(balance).length > 0,
+      assets: balance
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+router.get("/balance", async (_req, res) => {
+  try {
+    const balance = await getBalance();
+    res.json({ success: true, balance });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get("/ticker", async (req, res) => {
+  try {
+    const pair = req.query.pair || "XXBTZUSD";
+    const ticker = await getTicker(pair);
+    res.json({ success: true, ticker });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get("/candles", async (req, res) => {
+  try {
+    const pair = req.query.pair || "XXBTZUSD";
+    const interval = Number(req.query.interval || 60);
+    const candles = await getCandles(pair, interval);
+    res.json({ success: true, pair, interval, candles });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post("/cancel", async (req, res) => {
+  try {
+    const { txid } = req.body || {};
+
+    if (!txid) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing txid"
+      });
+    }
+
+    const result = await cancelOrder(txid);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+module.exports = router;
+
+
+
+backend/api/balanceRoute.js
+const express = require("express");
+const { getBalance, getTicker } = require("../config/krakenClient");
+
+const router = express.Router();
+
+function normalizeBalance(raw) {
+  const assetMap = {
+    ZUSD: "USD",
+    XXBT: "BTC",
+    XBT: "BTC",
+    XETH: "ETH",
+    ETH: "ETH"
+  };
+
+  return Object.entries(raw)
+    .map(([symbol, value]) => {
+      const amount = Number(value || 0);
+      return {
+        symbol,
+        asset: assetMap[symbol] || symbol,
+        amount
+      };
+    })
+    .filter((x) => x.amount > 0);
+}
+
+router.get("/balance", async (_req, res) => {
+  try {
+    const rawBalance = await getBalance();
+    const assets = normalizeBalance(rawBalance);
+
+    let btcUsd = 0;
+    try {
+      const ticker = await getTicker("XXBTZUSD");
+      btcUsd = ticker.last;
+    } catch {
+      btcUsd = 0;
+    }
+
+    const enriched = assets.map((a) => {
+      let usdValue = 0;
+
+      if (a.asset === "USD") usdValue = a.amount;
+      if (a.asset === "BTC" && btcUsd > 0) usdValue = a.amount * btcUsd;
+
+      return { ...a, usdValue };
+    });
+
+    const portfolioUsd = enriched.reduce((sum, a) => sum + a.usdValue, 0);
+
+    res.json({
+      success: true,
+      assets: enriched,
+      portfolioUsd
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+module.exports = router;
+
+
+
+backend/engine/globalPlugEngine.js
+function runGlobalPlugEngine(market, runtime = {}) {
+  const pair = market.pair || "XXBTZUSD";
+  const last = Number(market.ticker?.last || 0);
+  const candles = market.candles || [];
+
+  // Placeholder engine.
+  // Replace this with your full Global Plug strategy logic.
+  const minimax = {
+    decision: "BLOCK_SAFETY",
+    side: null,
+    size: 0,
+    reason: "Engine placeholder"
+  };
+
+  const flash = {
+    decision: "BLOCK_SAFETY",
+    side: null,
+    size: 0,
+    reason: "Engine placeholder"
+  };
+
+  if (candles.length >= 2 && last > 0) {
+    const prev = candles[candles.length - 2];
+    const curr = candles[candles.length - 1];
+
+    if (curr.close > prev.close) {
+      minimax.decision = "EXECUTE_B";
+      minimax.side = "buy";
+      minimax.size = runtime.baseSize || 2;
+
+      flash.decision = "EXECUTE_A";
+      flash.side = "buy";
+      flash.size = runtime.baseSize || 2;
+    } else if (curr.close < prev.close) {
+      minimax.decision = "EXECUTE_B";
+      minimax.side = "sell";
+      minimax.size = runtime.baseSize || 2;
+
+      flash.decision = "EXECUTE_A";
+      flash.side = "sell";
+      flash.size = runtime.baseSize || 2;
+    }
+  }
+
+  return {
+    system: "v2.1.1",
+    pair,
+    minimax,
+    flash,
+    meta: {
+      lastPrice: last,
+      candleCount: candles.length
+    }
+  };
+}
+
+module.exports = { runGlobalPlugEngine };
+
+
+
+backend/engine/safetyGovernor.js
+function checkSafetyGovernor({
+  agent,
+  runtime,
+  backendRequired,
+  backendAvailable,
+  marketOk,
+  balanceOk
+}) {
+  if (runtime.emergencyStopEnabled) {
+    return { status: "BLOCK_EMERGENCY_STOP", allow: false };
+  }
+
+  if (runtime.dailyPnL <= -Math.abs(runtime.maxDailyLoss || 100)) {
+    return { status: "BLOCK_DAILY_LOSS", allow: false };
+  }
+
+  if ((runtime.drawdownPercent || 0) >= (runtime.maxDrawdownPercent || 7)) {
+    return { status: "BLOCK_DRAWDOWN", allow: false };
+  }
+
+  if ((runtime.openTradeCount || 0) >= (runtime.maxOpenTrades || 2)) {
+    return { status: "BLOCK_MAX_OPEN_TRADES", allow: false };
+  }
+
+  if ((runtime.apiFailureCount || 0) >= (runtime.maxApiFailures || 3)) {
+    return { status: "BLOCK_API_FAILURE", allow: false };
+  }
+
+  if (!balanceOk) {
+    return { status: "BLOCK_BALANCE_UNAVAILABLE", allow: false };
+  }
+
+  if (!marketOk) {
+    return { status: "BLOCK_MARKET_DATA", allow: false };
+  }
+
+  if (backendRequired && !backendAvailable) {
+    return { status: "BLOCK_BACKEND_UNAVAILABLE", allow: false };
+  }
+
+  return { status: "ALLOW", allow: true, agent };
+}
+
+module.exports = { checkSafetyGovernor };
+
+
+
+backend/core/tradeExecutor.js
+const { addOrder } = require("../config/krakenClient");
+
+async function placeOrder({ pair, side, size, ordertype = "market", price }) {
+  if (!pair) throw new Error("Missing pair");
+  if (!side) throw new Error("Missing side");
+  if (!size || Number(size) <= 0) throw new Error("Invalid size");
+
+  const result = await addOrder({
+    pair,
+    side,
+    volume: size,
+    ordertype,
+    price
+  });
+
+  return {
+    success: true,
+    txid: result.txid || [],
+    raw: result
+  };
+}
+
+async function executeAgentDecision({ agentName, pair, agentResult }) {
+  const decision = agentResult?.decision;
+  const side = agentResult?.side;
+  const size = Number(agentResult?.size || 0);
+
+  if (!["EXECUTE_A", "EXECUTE_B"].includes(decision)) {
+    return {
+      success: true,
+      executed: false,
+      agent: agentName,
+      decision,
+      reason: "Blocked or no-trade"
+    };
+  }
+
+  const order = await placeOrder({ pair, side, size });
+
+  return {
+    success: true,
+    executed: true,
+    agent: agentName,
+    decision,
+    side,
+    size,
+    txid: order.txid,
+    raw: order.raw
+  };
+}
+
+module.exports = {
+  placeOrder,
+  executeAgentDecision
+};
+
+
+
+backend/state/runtimeStore.js
+const runtime = {
+  emergencyStopEnabled: false,
+  dailyPnL: 0,
+  drawdownPercent: 0,
+  openTradeCount: 0,
+  apiFailureCount: 0,
+  maxDailyLoss: 100,
+  maxDrawdownPercent: 7,
+  maxOpenTrades: 2,
+  maxApiFailures: 3,
+  baseSize: 2
+};
+
+function getRuntime() {
+  return runtime;
+}
+
+function setRuntimePatch(patch) {
+  Object.assign(runtime, patch);
+  return runtime;
+}
+
+function incrementApiFailure() {
+  runtime.apiFailureCount += 1;
+}
+
+function resetApiFailures() {
+  runtime.apiFailureCount = 0;
+}
+
+module.exports = {
+  getRuntime,
+  setRuntimePatch,
+  incrementApiFailure,
+  resetApiFailures
+};
+
+
+
+backend/utils/logger.js
+function logInfo(message, meta = {}) {
+  console.log(`[INFO] ${message}`, meta);
+}
+
+function logError(message, meta = {}) {
+  console.error(`[ERROR] ${message}`, meta);
+}
+
+module.exports = {
+  logInfo,
+  logError
+};
+
+
+
+backend/api/engineRoute.js
+const express = require("express");
+const { getTicker, getCandles, getBalance } = require("../config/krakenClient");
+const { runGlobalPlugEngine } = require("../engine/globalPlugEngine");
+const { checkSafetyGovernor } = require("../engine/safetyGovernor");
+const { executeAgentDecision } = require("../core/tradeExecutor");
+const {
+  getRuntime,
+  incrementApiFailure,
+  resetApiFailures
+} = require("../state/runtimeStore");
+const { logInfo, logError } = require("../utils/logger");
+
+const router = express.Router();
+
+router.post("/execute", async (req, res) => {
+  const pair = req.body?.pair || "XXBTZUSD";
+  const backendAvailable = true;
+  const backendRequired = true;
+
+  try {
+    const [ticker, candles, balance] = await Promise.all([
+      getTicker(pair),
+      getCandles(pair, 60),
+      getBalance()
+    ]);
+
+    const market = { pair, ticker, candles };
+    const runtime = getRuntime();
+    const engineResult = runGlobalPlugEngine(market, runtime);
+
+    const balanceOk = !!balance;
+    const marketOk = !!ticker && Array.isArray(candles) && candles.length > 0;
+
+    const mmSafety = checkSafetyGovernor({
+      agent: "MINIMAX",
+      runtime,
+      backendRequired,
+      backendAvailable,
+      marketOk,
+      balanceOk
+    });
+
+    const flSafety = checkSafetyGovernor({
+      agent: "FLASH",
+      runtime,
+      backendRequired,
+      backendAvailable,
+      marketOk,
+      balanceOk
+    });
+
+    let minimaxResult;
+    let flashResult;
+
+    if (!mmSafety.allow) {
+      minimaxResult = {
+        success: true,
+        executed: false,
+        agent: "MINIMAX",
+        decision: engineResult.minimax.decision,
+        safety: mmSafety.status
+      };
+    } else {
+      minimaxResult = await executeAgentDecision({
+        agentName: "MINIMAX",
+        pair,
+        agentResult: engineResult.minimax
+      });
+    }
+
+    if (!flSafety.allow) {
+      flashResult = {
+        success: true,
+        executed: false,
+        agent: "FLASH",
+        decision: engineResult.flash.decision,
+        safety: flSafety.status
+      };
+    } else {
+      flashResult = await executeAgentDecision({
+        agentName: "FLASH",
+        pair,
+        agentResult: engineResult.flash
+      });
+    }
+
+    resetApiFailures();
+
+    logInfo("Engine execute complete", {
+      pair,
+      minimax: minimaxResult,
+      flash: flashResult
+    });
+
+    res.json({
+      success: true,
+      engine: engineResult,
+      executions: {
+        minimax: minimaxResult,
+        flash: flashResult
+      }
+    });
+  } catch (error) {
+    incrementApiFailure();
+    logError("Engine execute failed", { pair, error: error.message });
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+module.exports = router;
+
+
+
+Run locally
+cd backend
+npm install
+cp .env.example .env
+# add real Kraken keys to backend/.env
+node server.js
+
+
+
+Test in this order
+curl http://localhost:3000/health
+curl http://localhost:3000/api/kraken/test
+curl http://localhost:3000/api/account/balance
+curl -X POST http://localhost:3000/api/engine/execute
+
+
+
+
+
+
